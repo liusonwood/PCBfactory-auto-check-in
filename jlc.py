@@ -13,6 +13,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from serverchan_sdk import sc_send
 
 # 全局变量用于收集总结日志
 in_summary = False
@@ -753,43 +754,108 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
             result['oshwhub_status'] = '密码错误'
             return result
 
-        # 处理滑块验证
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".btn_slide")))
+        # 处理阿里云滑块验证 (修复版)
         try:
-            slider = wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn_slide"))
+            # 1. 首先等待滑块容器出现且可见 (解决 element has no size 问题)
+            # 使用 visibility_of_element_located 确保元素必须有长宽且可见
+            log(f"账号 {account_index} - 等待滑块可见...")
+            wrapper = WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.ID, "aliyunCaptcha-sliding-wrapper"))
             )
             
-            track = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".nc_scale"))
+            # 2. 等待滑块按钮可点击
+            slider = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.ID, "aliyunCaptcha-sliding-slider"))
             )
             
-            track_width = track.size['width']
+            # 给一点渲染缓冲时间，防止动画未结束
+            time.sleep(1.5)
+            
+            # 计算需要滑动的距离
+            wrapper_width = wrapper.size['width']
             slider_width = slider.size['width']
-            move_distance = track_width - slider_width - 10
+            distance = wrapper_width - slider_width
             
-            log(f"账号 {account_index} - 检测到滑块验证码，滑动距离: {move_distance}px")
+            log(f"账号 {account_index} - 检测到阿里云滑块，容器宽:{wrapper_width}, 滑块宽:{slider_width}, 需滑动:{distance}")
             
+            if distance <= 0:
+                distance = 360  # 兜底默认值
+            
+            # 生成更像人类的轨迹（物理加速/减速模型）
+            def generate_human_tracks(distance):
+                tracks = []
+                current = 0
+                # 留出一点距离用于回退，模拟过冲
+                target = distance + random.randint(2, 5) 
+                
+                mid = target * 3 / 5  # 减速点后移
+                t = 0.2
+                v = 0
+                
+                while current < target:
+                    if current < mid:
+                        a = random.uniform(3, 5)   # 加速快一点
+                    else:
+                        a = -random.uniform(4, 6)  # 减速急一点
+                    
+                    v0 = v
+                    v = v0 + a * t
+                    move = v0 * t + 0.5 * a * t * t
+                    
+                    if move < 1: move = 1 # 防止不动
+                    
+                    current += move
+                    tracks.append(round(move))
+                
+                return tracks
+
+            tracks = generate_human_tracks(distance)
+            
+            # 开始拖动
             actions = ActionChains(driver)
+            
+            # 1. 按住
             actions.click_and_hold(slider).perform()
-            time.sleep(0.5)
+            time.sleep(0.3)
             
-            quick_distance = int(move_distance * random.uniform(0.6, 0.8))
-            slow_distance = move_distance - quick_distance
+            # 2. 移动
+            for track in tracks:
+                y_offset = random.randint(-1, 1) # Y轴微小抖动
+                actions.move_by_offset(xoffset=track, yoffset=y_offset).perform()
+                # 极短的随机间隔
+                time.sleep(random.uniform(0.005, 0.02))
             
-            y_offset1 = random.randint(-2, 2)
-            actions.move_by_offset(quick_distance, y_offset1).perform()
-            time.sleep(random.uniform(0.1, 0.3))
-            
-            y_offset2 = random.randint(-2, 2)
-            actions.move_by_offset(slow_distance, y_offset2).perform()
-            time.sleep(random.uniform(0.05, 0.15))
-            
+            # 3. 模拟回退 (过冲修正) - 这是过滑块的关键
+            # 阿里云往往检测最后是否有修正动作
+            back_tracks = [ -1, -1, -2, -1 ] # 往回拉一点
+            for back in back_tracks:
+                actions.move_by_offset(xoffset=back, yoffset=0).perform()
+                time.sleep(0.1)
+
+            # 4. 停顿后松开
+            time.sleep(random.uniform(0.3, 0.6))
             actions.release().perform()
-            log(f"账号 {account_index} - 滑块拖动完成")
+            
+            log(f"账号 {account_index} - 阿里云滑块拖动完成")
             
             # 滑块验证后立即检查密码错误提示
-            time.sleep(1)  # 给错误提示一点时间显示
+            time.sleep(2) 
+            if check_password_error(driver, account_index):
+                result['password_error'] = True
+                result['oshwhub_status'] = '密码错误'
+                return result
+                
+            WebDriverWait(driver, 15).until(lambda d: "oshwhub.com" in d.current_url and "passport.jlc.com" not in d.current_url)
+            
+        except Exception as e:
+            # 如果是找不到元素（可能是没有触发滑块），不视为严重错误
+            if "Time.out" in str(e) or "no such element" in str(e):
+                log(f"账号 {account_index} - 未检测到滑块或无需验证")
+            else:
+                log(f"账号 {account_index} - 滑块验证异常: {e}")
+            
+            # 再次检查是否已经跳转或密码错误（防止是滑块验证通过了但报错掩盖了跳转）
+            time.sleep(1)
             if check_password_error(driver, account_index):
                 result['password_error'] = True
                 result['oshwhub_status'] = '密码错误'
@@ -797,14 +863,17 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
                 
             WebDriverWait(driver, 10).until(lambda d: "oshwhub.com" in d.current_url and "passport.jlc.com" not in d.current_url)
             
-        except Exception as e:
-            log(f"账号 {account_index} - 滑块验证处理: {e}")
-            # 滑块验证失败后检查密码错误
-            time.sleep(1)
-            if check_password_error(driver, account_index):
-                result['password_error'] = True
-                result['oshwhub_status'] = '密码错误'
-                return result
+    except Exception as e:
+        # 如果没有检测到滑块，可能是直接登录成功了，或者是旧版滑块，或者是其他错误
+        if "Time.out" not in str(e): # 只有非超时错误才记录详细
+            log(f"账号 {account_index} - 滑块验证处理(或未出现): {e}")
+        
+        # 再次检查是否已经跳转或密码错误
+        time.sleep(1)
+        if check_password_error(driver, account_index):
+            result['password_error'] = True
+            result['oshwhub_status'] = '密码错误'
+            return result
 
         # 等待跳转
         log(f"账号 {account_index} - 等待登录跳转...")
@@ -1223,6 +1292,21 @@ def push_summary():
         except:
             pass
 
+    # Server酱3
+    serverchan3_sckey = os.getenv('SERVERCHAN3_SCKEY') 
+    if serverchan3_sckey:
+        try:
+            textSC3 = "\n\n".join(summary_logs)
+            titleSC3 = title
+            options = {"tags": "嘉立创|签到"}  # 可选参数，根据需求添加
+            response = sc_send(serverchan3_sckey, titleSC3, textSC3, options)            
+            if response.get("code") == 0:  # 新版成功返回 code=0
+                log("Server酱3-日志已推送")
+            else:
+                log(f"Server酱推送失败: {response.get('message')}")                
+        except Exception as e:
+            log(f"Server酱推送异常: {str(e)}")    
+
     # 酷推 (CoolPush)
     coolpush_skey = os.getenv('COOLPUSH_SKEY')
     if coolpush_skey:
@@ -1326,7 +1410,7 @@ def main():
         
         retry_label = ""
         if retry_count > 0:
-             retry_label = f" [重试{retry_count}次]"
+            retry_label = f" [重试{retry_count}次]"
         elif is_final_retry:
             retry_label = " [最终重试]"
         
